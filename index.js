@@ -14,6 +14,16 @@ const {
   AuditLogEvent
 } = require("discord.js");
 
+// ---------- Health Check Server for Render & Uptime Robot ----------
+const express = require("express");
+const app = express();
+
+app.get("/", (req, res) => res.send("✅ AutoBanNet is running!"));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Health check server listening on port ${PORT}`));
+
+
 const CONFIG_PATH = "./config.json";
 let config = {};
 if (fs.existsSync(CONFIG_PATH)) {
