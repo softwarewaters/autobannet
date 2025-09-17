@@ -13,16 +13,15 @@ const {
   EmbedBuilder,
   AuditLogEvent
 } = require("discord.js");
-
-// ---------- Health Check Server for Render & Uptime Robot ----------
 const express = require("express");
+const cron = require("node-cron"); // Import the node-cron library
 const app = express();
 
+// ---------- Health Check Server for Render & Uptime Robot ----------
 app.get("/", (req, res) => res.send("✅ AutoBanNet is running!"));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Health check server listening on port ${PORT}`));
-
 
 const CONFIG_PATH = "./config.json";
 let config = {};
@@ -87,7 +86,14 @@ const setupCommand = new SlashCommandBuilder()
     .setDescription("Manage global blacklist servers")
     .addStringOption(o => o.setName("action").setDescription("add/remove/list").setRequired(true)
       .addChoices({ name: "add", value: "add" }, { name: "remove", value: "remove" }, { name: "list", value: "list" }))
-    .addStringOption(o => o.setName("guildid").setDescription("Guild ID").setRequired(false)));
+    .addStringOption(o => o.setName("guildid").setDescription("Guild ID").setRequired(false)))
+  .addSubcommand(sc => sc.setName("automessage")
+    .setDescription("Set or clear an automatic message to be sent every 6 hours")
+    .addStringOption(o => o.setName("action").setDescription("Set or Clear the message").setRequired(true)
+      .addChoices({ name: "set", value: "set" }, { name: "clear", value: "clear" }))
+    .addChannelOption(o => o.setName("channel").setDescription("Channel for the message").setRequired(false))
+    .addStringOption(o => o.setName("message").setDescription("The message content (required for 'set')").setRequired(false)));
+
 
 const banCommand = new SlashCommandBuilder()
   .setName("ban")
@@ -125,8 +131,6 @@ async function registerCommands() {
         Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.TEST_GUILD_ID),
         { body: commandList });
       console.log(`✅ Registered ${data.length} guild commands for ${process.env.TEST_GUILD_ID}`);
-
-      // Remove duplicate global commands with same names
       try {
         const globalCommands = await rest.get(Routes.applicationCommands(process.env.CLIENT_ID));
         for (const gCmd of globalCommands) {
@@ -147,13 +151,33 @@ async function registerCommands() {
 }
 registerCommands();
 
-// ---------- Presence ----------
+// ---------- Presence and Auto-Messages ----------
 client.once("ready", () => {
   console.log(`${client.user.tag} is online!`);
   client.user.setPresence({
     activities: [{ name: "Protecting servers • AutoBanNet 🔒", type: ActivityType.Watching }],
     status: "online"
   });
+
+  // Schedule automatic messages for all configured guilds
+  for (const guildId in config) {
+    if (config[guildId] && config[guildId].autoMessage) {
+      const { channelId, messageContent } = config[guildId].autoMessage;
+      if (channelId && messageContent) {
+        cron.schedule("0 */6 * * *", async () => { // Every 6 hours
+          try {
+            const channel = await client.channels.fetch(channelId).catch(() => null);
+            if (channel && channel.isTextBased()) {
+              await channel.send(messageContent);
+              console.log(`Sent auto-message to channel ${channelId} in guild ${guildId}`);
+            }
+          } catch (err) {
+            console.error(`Failed to send auto-message to channel ${channelId}:`, err);
+          }
+        });
+      }
+    }
+  }
 });
 
 // ---------- Helpers ----------
@@ -175,7 +199,6 @@ async function sendLogToGuild(guildId, embed) {
   } catch (err) { console.warn("Failed to send log embed:", err.message || err); }
 }
 
-// Ban a user across all guilds where bot has BanMembers permission
 async function banUserAcrossAllGuilds(userId, reason, originGuildName = "AutoBanNet", moderatorTag = "AutoBanNet (blacklist)") {
   for (const [gId, guild] of client.guilds.cache) {
     try {
@@ -183,7 +206,6 @@ async function banUserAcrossAllGuilds(userId, reason, originGuildName = "AutoBan
       if (!me) continue;
       if (!me.permissions.has(PermissionFlagsBits.BanMembers)) continue;
       await guild.bans.create(userId, { reason: `[AutoBanNet] ${reason}` }).catch(() => null);
-      // send log to each guild where configured
       const embed = logEmbedForAction({
         action: "Auto-Ban (Blacklist)",
         targetTag: `${userId}`,
@@ -209,7 +231,7 @@ client.on("interactionCreate", async interaction => {
     if (cmd === "setup") {
       if (!interaction.guild) return interaction.reply({ embeds: [makeEmbed("error", "Server Only", "This command must be used inside a server.")], ephemeral: false });
       const sub = interaction.options.getSubcommand();
-      if (!config[interaction.guild.id]) config[interaction.guild.id] = { roles: [], banSyncGuilds: [], logChannelId: null };
+      if (!config[interaction.guild.id]) config[interaction.guild.id] = { roles: [], banSyncGuilds: [], logChannelId: null, autoMessage: null };
       const invoker = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
       if (!invoker || !invoker.permissions.has(PermissionFlagsBits.ManageGuild)) {
         return interaction.reply({ embeds: [makeEmbed("error", "No Permission", "You need Manage Server permission to run setup.")], ephemeral: false });
@@ -232,7 +254,6 @@ client.on("interactionCreate", async interaction => {
           if (!config[interaction.guild.id].banSyncGuilds.includes(gid)) {
             config[interaction.guild.id].banSyncGuilds.push(gid);
             saveConfig();
-            // log to mod-log if set
             const embed = makeEmbed("success", "Ban Sync Added", `✅ Guild ID **${gid}** added to ban sync list.`);
             await interaction.reply({ embeds: [embed], ephemeral: false });
             await sendLogToGuild(interaction.guild.id, new EmbedBuilder().setTitle("Ban-Sync: Server Added").setDescription(`Guild ID \`${gid}\` was added to ban-sync list by <@${interaction.user.id}>`).setTimestamp());
@@ -266,23 +287,6 @@ client.on("interactionCreate", async interaction => {
         }
       }
 
-      if (sub === "view") {
-        const roles = (config[interaction.guild.id].roles || []).map(r => `<@&${r}>`).join(", ") || "None";
-        const banGuilds = (config[interaction.guild.id].banSyncGuilds || []).join(", ") || "None";
-        const logCh = config[interaction.guild.id].logChannelId ? `<#${config[interaction.guild.id].logChannelId}>` : "None";
-        const viewEmbed = new EmbedBuilder()
-          .setTitle(`Setup for ${interaction.guild.name}`)
-          .addFields(
-            { name: "Moderation Roles", value: roles, inline: false },
-            { name: "Ban Sync Guild IDs", value: banGuilds, inline: false },
-            { name: "Log Channel", value: logCh, inline: false }
-          )
-          .setColor(0x06b6d4)
-          .setTimestamp()
-          .setFooter({ text: "AutoBanNet" });
-        return interaction.reply({ embeds: [viewEmbed], ephemeral: false });
-      }
-
       if (sub === "blacklist") {
         const action = interaction.options.getString("action");
         const gid = interaction.options.getString("guildid");
@@ -311,6 +315,28 @@ client.on("interactionCreate", async interaction => {
           await interaction.reply({ embeds: [makeEmbed("success", "Blacklisted Guild Removed", `✅ Guild ID **${gid}** removed from global blacklist.`)], ephemeral: false });
           await sendLogToGuild(interaction.guild.id, new EmbedBuilder().setTitle("Blacklist: Server Removed").setDescription(`Guild ID \`${gid}\` removed from global blacklist by <@${interaction.user.id}>`).setTimestamp());
           return;
+        }
+      }
+      
+      if (sub === "automessage") {
+        const action = interaction.options.getString("action");
+        const channel = interaction.options.getChannel("channel");
+        const messageContent = interaction.options.getString("message");
+
+        if (action === "set") {
+          if (!channel || !messageContent) {
+            return interaction.reply({ embeds: [makeEmbed("error", "Missing Options", "To set a message, you must provide both a channel and a message.")], ephemeral: true });
+          }
+          if (!channel.isTextBased()) {
+            return interaction.reply({ embeds: [makeEmbed("error", "Invalid Channel", "Please provide a text channel for the auto-message.")], ephemeral: true });
+          }
+          config[interaction.guild.id].autoMessage = { channelId: channel.id, messageContent: messageContent };
+          saveConfig();
+          return interaction.reply({ embeds: [makeEmbed("success", "Auto-Message Set", `✅ An automatic message has been set to send every 6 hours in ${channel}.`)], ephemeral: false });
+        } else if (action === "clear") {
+          config[interaction.guild.id].autoMessage = null;
+          saveConfig();
+          return interaction.reply({ embeds: [makeEmbed("success", "Auto-Message Cleared", "✅ The automatic message has been cleared.")], ephemeral: false });
         }
       }
     }
@@ -351,7 +377,6 @@ client.on("interactionCreate", async interaction => {
           await interaction.reply({ embeds: [out], ephemeral: false });
           await sendLogToGuild(interaction.guild.id, out);
 
-          // sync if configured
           const gcfg = config[interaction.guild.id];
           if (gcfg && Array.isArray(gcfg.banSyncGuilds) && gcfg.banSyncGuilds.length) {
             for (const tgtG of gcfg.banSyncGuilds) {
@@ -437,7 +462,6 @@ client.on("interactionCreate", async interaction => {
 });
 
 // ---------- Guild events ----------
-// When a ban is detected (not via command), try to log and propagate
 client.on("guildBanAdd", async ban => {
   try {
     const guildId = ban.guild.id;
@@ -463,7 +487,6 @@ client.on("guildBanAdd", async ban => {
 
     await sendLogToGuild(guildId, out);
 
-    // propagate according to this guild config
     if (config[guildId] && Array.isArray(config[guildId].banSyncGuilds) && config[guildId].banSyncGuilds.length) {
       for (const tgtG of config[guildId].banSyncGuilds) {
         try {
@@ -488,23 +511,19 @@ client.on("guildBanAdd", async ban => {
   }
 });
 
-// When a member joins, check global blacklist membership (only works if bot is in blacklisted guilds)
 client.on("guildMemberAdd", async member => {
   try {
     if (!config._global || !Array.isArray(config._global.blacklistedGuilds) || !config._global.blacklistedGuilds.length) return;
 
     const userId = member.user.id;
-    // Check each blacklisted guild (only those the bot is also in)
     for (const blackG of config._global.blacklistedGuilds) {
       const blackGuild = client.guilds.cache.get(blackG);
-      if (!blackGuild) continue; // bot not in that blacklisted guild, can't check
+      if (!blackGuild) continue;
       try {
         const found = await blackGuild.members.fetch(userId).catch(() => null);
         if (found) {
-          // user is in a blacklisted guild -> auto-ban across all bot guilds
           const reason = `Auto-ban: User found in blacklisted guild ${blackGuild.name} (${blackG})`;
           await banUserAcrossAllGuilds(userId, reason, member.guild.name, `AutoBanNet (blacklist: ${blackG})`);
-          // report to the guild where member joined
           const out = logEmbedForAction({
             action: "Auto-Ban Triggered",
             targetTag: `${member.user.tag}`,
@@ -514,7 +533,7 @@ client.on("guildMemberAdd", async member => {
             guildName: member.guild.name
           });
           await sendLogToGuild(member.guild.id, out);
-          break; // done after first matching blacklisted guild
+          break;
         }
       } catch (err) {
         console.warn(`Error checking blacklisted guild ${blackG}:`, err.message || err);
@@ -525,7 +544,6 @@ client.on("guildMemberAdd", async member => {
   }
 });
 
-// Log when bot joins a guild (optional): notify the guild's mod-log if they set it later via setup
 client.on("guildCreate", async guild => {
   console.log(`Joined guild: ${guild.name} (${guild.id})`);
 });
