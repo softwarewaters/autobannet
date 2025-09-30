@@ -382,7 +382,7 @@ async function registerCommands() {
 client.on('ready', async () => {
     console.log(`Logged in as ${client.user.tag}`);
     client.user.setPresence({
-        activities: [{ name: 'Playing with my ban hammer', type: 3 }],
+        activities: [{ name: 'Playing with my ban hammer', type: 0 }], // Changed type from 3 to 0
         status: 'online'
     });
     await registerCommands();
